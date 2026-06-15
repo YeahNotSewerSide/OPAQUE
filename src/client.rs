@@ -1,3 +1,12 @@
+//! Stateless client-side OPAQUE functions.
+//!
+//! Call order:
+//! 1. [`registration_start`] → send [`RegistrationRequest`] to server
+//! 2. [`registration_finish`] → send [`RegistrationRecord`] to server, store `export_key`
+//!
+//! 1. [`login_start`] → send [`Ke1`] to server
+//! 2. [`login_finish`] → send [`Ke3`] to server, use `SessionKey` and `export_key`
+
 use curve25519_dalek::Scalar;
 use rand::RngExt as _;
 
@@ -11,12 +20,28 @@ use crate::{
     wire_structs::{Ke1, Ke2, Ke3, RegistrationRecord, RegistrationRequest, RegistrationResponse},
 };
 
+/// Ephemeral client state kept between [`login_start`] and [`login_finish`].
+///
+/// Must not be reused across login attempts.
 pub struct ClientLoginState {
+    /// OPRF blinding scalar. Combined with the server's evaluation in
+    /// [`login_finish`] to recover the OPRF output.
     pub blind: Scalar,
+    /// Client's ephemeral Diffie-Hellman scalar for the 3DH key exchange.
     pub client_ephemeral_sk: Scalar,
+    /// The KE1 message sent to the server. Kept here so [`login_finish`]
+    /// can include it in the transcript MAC without a second argument.
     pub ke1: Ke1,
 }
-/// Registration step 1 (client): blind password, build RegistrationRequest.
+
+/// Registration step 1 (client) — RFC 9807 §5.2.1.
+///
+/// Hashes the password to a Ristretto255 point and applies a random blinding
+/// scalar so the server learns nothing about the password.
+///
+/// # Returns
+/// `(blind, request)` — `blind` must be passed to [`registration_finish`];
+/// `request` is sent to the server.
 pub fn registration_start(password: &[u8]) -> (Scalar, RegistrationRequest) {
     let (blind, blinded) = oprf_blind(password);
     (
@@ -27,8 +52,21 @@ pub fn registration_start(password: &[u8]) -> (Scalar, RegistrationRequest) {
     )
 }
 
-/// Registration step 2 (client): finalize OPRF, build envelope, return record + export_key.
-/// RFC 9807 §5.2.3 FinalizeRegistrationRequest.
+/// Registration step 2 (client) — RFC 9807 §5.2.3 FinalizeRegistrationRequest.
+///
+/// Finalizes the OPRF, derives envelope keys from the randomized password,
+/// and constructs the [`RegistrationRecord`] the server will persist.
+///
+/// # Parameters
+/// - `blind` — blinding scalar from [`registration_start`]
+/// - `response` — [`RegistrationResponse`] received from the server
+/// - `server_identity` — server's identity bytes (e.g. `b"example.com"`)
+/// - `client_identity` — client's identity bytes (e.g. their username)
+///
+/// # Returns
+/// `(record, export_key)` — send `record` to the server; `export_key` is a
+/// 64-byte client-only secret derived from the password that the server never
+/// sees. It can be used for end-to-end encrypted storage.
 pub fn registration_finish(
     blind: &Scalar,
     response: &RegistrationResponse,
@@ -75,8 +113,14 @@ pub fn registration_finish(
     )
 }
 
-/// Login step 1 (client): blind password, generate ephemeral keypair, build KE1.
-/// RFC 9807 §6.2.1 GenerateKE1.
+/// Login step 1 (client) — RFC 9807 §6.2.1 GenerateKE1.
+///
+/// Blinds the password and generates an ephemeral keypair for the 3DH
+/// key exchange.
+///
+/// # Returns
+/// [`ClientLoginState`] containing `ke1` to send to the server and the
+/// ephemeral secrets needed in [`login_finish`].
 pub fn login_start(password: &[u8]) -> ClientLoginState {
     let (blind, blinded) = oprf_blind(password);
     let mut rng = rand::rng();
@@ -97,9 +141,25 @@ pub fn login_start(password: &[u8]) -> ClientLoginState {
     }
 }
 
-/// Login step 2 (client): recover credentials from envelope, run 3DH, verify server,
-/// produce KE3 + session_key + export_key.
-/// RFC 9807 §6.2.3 GenerateKE3 + §6.4.3 AuthClientFinalize.
+/// Login step 2 (client) — RFC 9807 §6.2.3 GenerateKE3 + §6.4.3 AuthClientFinalize.
+///
+/// Recovers credentials from the envelope, performs the 3DH key exchange,
+/// verifies the server MAC, and produces the client MAC.
+///
+/// # Parameters
+/// - `state` — [`ClientLoginState`] from [`login_start`]
+/// - `ke2` — [`Ke2`] received from the server
+/// - `server_identity` — must match what was used during registration
+/// - `client_identity` — must match what was used during registration
+///
+/// # Errors
+/// - [`OpaqueError::EnvelopeRecoveryError`] — wrong password
+/// - [`OpaqueError::ServerAuthenticationError`] — server MAC did not verify
+///
+/// # Returns
+/// `(ke3, session_key, export_key)` — send `ke3` to the server;
+/// `session_key` matches the server's [`SessionKey`] after [`OpaqueSession::login_finish`];
+/// `export_key` matches the one from [`registration_finish`].
 pub fn login_finish(
     state: ClientLoginState,
     ke2: &Ke2,
