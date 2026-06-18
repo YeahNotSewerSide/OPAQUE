@@ -321,6 +321,23 @@ impl SessionKey {
             .map_err(|e| anyhow::anyhow!(e))
     }
 
+    /// Mint a JWT signed with HMAC-SHA-256 keyed by the session key.
+    ///
+    /// The caller is responsible for constructing appropriate claims (expiry,
+    /// audience, subject, etc.).
+    pub fn mint_jwt_with_salt<T: Serialize>(
+        &self,
+        header: &Header,
+        claims: &T,
+        salt: &[u8],
+    ) -> anyhow::Result<String> {
+        let mut full_secret = Vec::with_capacity(self.0.len());
+        full_secret.extend_from_slice(&self.0);
+        full_secret.extend_from_slice(salt);
+        jsonwebtoken::encode(header, claims, &EncodingKey::from_secret(&full_secret))
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
     /// Verify and decode a JWT previously minted with [`mint_jwt`].
     ///
     /// Validates the HS256 signature and requires `aud == "access"`.
